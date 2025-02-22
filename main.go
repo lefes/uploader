@@ -236,18 +236,62 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	<style>
 		body { background-color: #f8f9fa; }
 		.container { max-width: 600px; margin-top: 50px; }
+		.progress { margin-top: 10px; height: 25px; }
 	</style>
 </head>
 <body>
 <div class="container">
 	<h2 class="mb-4 text-center">Загрузка видео файлов</h2>
-	<form method="POST" action="/upload" enctype="multipart/form-data">
+	<form id="uploadForm">
 		<div class="mb-3">
-			<input class="form-control" type="file" name="videos" multiple accept="video/*">
+			<input class="form-control" type="file" name="videos" id="videos" multiple accept="video/*">
 		</div>
 		<button type="submit" class="btn btn-primary w-100">Загрузить</button>
 	</form>
+	<div class="progress" id="progressContainer" style="display:none;">
+		<div class="progress-bar" id="progressBar" role="progressbar" style="width: 0%;">0%</div>
+	</div>
+	<div id="message" class="mt-3"></div>
 </div>
+<script>
+document.getElementById('uploadForm').addEventListener('submit', function(e) {
+	e.preventDefault();
+	var files = document.getElementById('videos').files;
+	if (files.length === 0) {
+		alert("Выберите хотя бы один файл.");
+		return;
+	}
+	var formData = new FormData();
+	for (var i = 0; i < files.length; i++) {
+		formData.append('videos', files[i]);
+	}
+	var xhr = new XMLHttpRequest();
+	xhr.open('POST', '/upload', true);
+	xhr.upload.onprogress = function(event) {
+		if (event.lengthComputable) {
+			var percentComplete = Math.round((event.loaded / event.total) * 100);
+			document.getElementById('progressContainer').style.display = 'block';
+			document.getElementById('progressBar').style.width = percentComplete + '%';
+			document.getElementById('progressBar').textContent = percentComplete + '%';
+		}
+	};
+	xhr.onload = function() {
+		if (xhr.status === 200) {
+			document.getElementById('message').innerHTML = '<div class="alert alert-success">Все файлы успешно загружены!</div>';
+			document.getElementById('uploadForm').reset();
+			document.getElementById('progressContainer').style.display = 'none';
+			document.getElementById('progressBar').style.width = '0%';
+			document.getElementById('progressBar').textContent = '0%';
+		} else {
+			document.getElementById('message').innerHTML = '<div class="alert alert-danger">Ошибка: ' + xhr.responseText + '</div>';
+		}
+	};
+	xhr.onerror = function() {
+		document.getElementById('message').innerHTML = '<div class="alert alert-danger">Ошибка загрузки файла.</div>';
+	};
+	xhr.send(formData);
+});
+</script>
 </body>
 </html>
 	`)
