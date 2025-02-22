@@ -133,6 +133,7 @@ func main() {
 		BasePath:              "/files/",
 		StoreComposer:         composer,
 		NotifyCompleteUploads: true,
+		DisableDownload:       true,
 	}
 	tusHandler, err := tusd.NewHandler(config)
 	if err != nil {
