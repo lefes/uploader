@@ -133,7 +133,11 @@ func main() {
 		BasePath:              "/files/",
 		StoreComposer:         composer,
 		NotifyCompleteUploads: true,
-		DisableDownload:       true,
+		DisableDownload:       true, // можно изменить по необходимости
+		MaxSize:               0,    // лимита нет
+		Cors: &tusd.CorsConfig{
+			Disable: true,
+		},
 	}
 	tusHandler, err := tusd.NewHandler(config)
 	if err != nil {
