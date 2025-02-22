@@ -21,6 +21,7 @@ import (
 var (
 	UploadPath     string
 	TempUploadPath string
+	BaseURL        string
 )
 
 func init() {
@@ -33,6 +34,11 @@ func init() {
 		TempUploadPath = tempPath
 	} else {
 		TempUploadPath = "./tusdata"
+	}
+	if baseURL := os.Getenv("BASE_URL"); baseURL != "" {
+		BaseURL = baseURL + "/files/"
+	} else {
+		BaseURL = "/files/"
 	}
 	os.MkdirAll(UploadPath, os.ModePerm)
 	os.MkdirAll(TempUploadPath, os.ModePerm)
@@ -130,14 +136,11 @@ func main() {
 	locker.UseIn(composer)
 
 	config := tusd.Config{
-		BasePath:              "/files/",
+		BasePath:              BaseURL,
 		StoreComposer:         composer,
 		NotifyCompleteUploads: true,
-		DisableDownload:       true, // можно изменить по необходимости
-		MaxSize:               0,    // лимита нет
-		Cors: &tusd.CorsConfig{
-			Disable: true,
-		},
+		DisableDownload:       true,
+		MaxSize:               0,
 	}
 	tusHandler, err := tusd.NewHandler(config)
 	if err != nil {
