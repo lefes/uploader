@@ -1,0 +1,31 @@
+version: '3'
+
+services:
+  video-uploader:
+    build: .
+    container_name: video-uploader
+    restart: unless-stopped
+    environment:
+      - MAX_UPLOAD_SIZE=20480
+      - MAX_MEMORY=256
+      - UPLOAD_PATH=/app/uploads
+      - TEMP_UPLOAD_PATH=/app/temp_uploads
+    volumes:
+      - /mnt/wd/videos:/app/uploads
+      - /mnt/wd/tmp:/app/temp_uploads
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      - "traefik.http.routers.video-uploader.entrypoints=websecure"
+      - "traefik.http.routers.video-uploader.rule=Host(`video.example.com`)"
+      - "traefik.http.routers.video-uploader.tls=true"
+      - "traefik.http.routers.video-uploader.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.video-uploader.middlewares=video-uploader-auth"
+      - "traefik.http.middlewares.video-uploader-auth.basicauth.users=video:$$2y$$05$$somehash"
+      - "traefik.http.services.video-uploader.loadbalancer.server.port=8080"
+
+networks:
+  traefik:
+    external: true
