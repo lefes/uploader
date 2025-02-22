@@ -141,6 +141,7 @@ func main() {
 		NotifyCompleteUploads: true,
 		DisableDownload:       true,
 		MaxSize:               0,
+		NetworkTimeout:        30 * time.Minute,
 	}
 	tusHandler, err := tusd.NewHandler(config)
 	if err != nil {
