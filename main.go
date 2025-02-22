@@ -13,16 +13,18 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"syscall"
 	"time"
 )
 
 var (
-	MaxUploadSize  int64
-	MaxMemory      int64
-	UploadPath     string
-	TempUploadPath string
+	MaxUploadSize       int64
+	MaxMemory           int64
+	UploadPath          string
+	TempUploadPath      string
+	MaxConcurrentChunks int
 )
 
 func init() {
@@ -45,6 +47,16 @@ func init() {
 		}
 	} else {
 		MaxMemory = 32 << 20
+	}
+	if mcStr := os.Getenv("MAX_CONCURRENT_CHUNKS"); mcStr != "" {
+		if mc, err := strconv.Atoi(mcStr); err == nil {
+			MaxConcurrentChunks = mc
+		} else {
+			log.Printf("Error parsing MAX_CONCURRENT_CHUNKS: %v, using default", err)
+			MaxConcurrentChunks = 5
+		}
+	} else {
+		MaxConcurrentChunks = 5
 	}
 	if path := os.Getenv("UPLOAD_PATH"); path != "" {
 		UploadPath = path
@@ -128,6 +140,51 @@ func moveFile(src, dst string) error {
 	return err
 }
 
+func combineChunks(ctx context.Context, uploadID, filename string, totalChunks int, totalSize int64) error {
+	tempDir := filepath.Join(TempUploadPath, uploadID)
+	finalTempPath := filepath.Join(tempDir, "combined")
+	out, err := os.Create(finalTempPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	var keys []int
+	for i := 0; i < totalChunks; i++ {
+		keys = append(keys, i)
+	}
+	sort.Ints(keys)
+	for _, index := range keys {
+		chunkPath := filepath.Join(tempDir, fmt.Sprintf("chunk_%d", index))
+		in, err := os.Open(chunkPath)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(out, in)
+		in.Close()
+		if err != nil {
+			return err
+		}
+	}
+	info, err := os.Stat(finalTempPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() != totalSize {
+		return fmt.Errorf("combined file size mismatch: expected %d, got %d", totalSize, info.Size())
+	}
+	hash, err := randomHash(4)
+	if err != nil {
+		return err
+	}
+	timestamp := time.Now().Format("20060102_150405")
+	newFileName := fmt.Sprintf("%s_%s_%s", hash, timestamp, filepath.Base(filename))
+	finalPath := filepath.Join(UploadPath, newFileName)
+	if err := moveFile(finalTempPath, finalPath); err != nil {
+		return err
+	}
+	return os.RemoveAll(tempDir)
+}
+
 func uploadChunkHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if r.Method != http.MethodPost {
@@ -168,55 +225,40 @@ func uploadChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer chunkFile.Close()
-	tempFileName := fmt.Sprintf("%s_%s", uploadID, filepath.Base(filename))
-	tempFilePath := filepath.Join(TempUploadPath, tempFileName)
-	f, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	tempDir := filepath.Join(TempUploadPath, uploadID)
+	os.MkdirAll(tempDir, os.ModePerm)
+	chunkPath := filepath.Join(tempDir, fmt.Sprintf("chunk_%d", chunkIndex))
+	out, err := os.Create(chunkPath)
 	if err != nil {
-		http.Error(w, "Error opening temp file: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
+		http.Error(w, "Error creating chunk file: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
 		return
 	}
-	defer f.Close()
-	_, err = copyWithContext(ctx, f, chunkFile)
+	_, err = copyWithContext(ctx, out, chunkFile)
+	out.Close()
 	if err != nil {
 		http.Error(w, "Error writing chunk: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
 		return
 	}
-	info, err := os.Stat(tempFilePath)
+	files, err := os.ReadDir(tempDir)
 	if err != nil {
-		http.Error(w, "Error stating temp file: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
+		http.Error(w, "Error reading temp dir: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
 		return
 	}
-	progress := float64(info.Size()) / float64(totalSize) * 100
+	progress := float64(len(files)) / float64(totalChunks) * 100
 	w.Header().Set("Content-Type", "text/html")
-	if chunkIndex == totalChunks-1 {
-		if info.Size() != totalSize {
-			os.Remove(tempFilePath)
-			http.Error(w, "File incomplete, expected size mismatch", http.StatusInternalServerError)
-			return
-		}
-		hash, err := randomHash(4)
-		if err != nil {
-			os.Remove(tempFilePath)
-			http.Error(w, "Error generating hash: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
-			return
-		}
-		timestamp := time.Now().Format("20060102_150405")
-		newFileName := fmt.Sprintf("%s_%s_%s", hash, timestamp, filepath.Base(filename))
-		finalPath := filepath.Join(UploadPath, newFileName)
-		if err := moveFile(tempFilePath, finalPath); err != nil {
-			os.Remove(tempFilePath)
-			http.Error(w, "Error moving file: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
+	if len(files) == totalChunks {
+		if err := combineChunks(ctx, uploadID, filename, totalChunks, totalSize); err != nil {
+			http.Error(w, "Error combining chunks: "+html.EscapeString(err.Error()), http.StatusInternalServerError)
 			return
 		}
 		fmt.Fprintf(w, `<div class="text-success">Файл %s загружен успешно!</div>`, html.EscapeString(filename))
 		return
 	}
-	fmt.Fprintf(w, `<div>Чанк %d из %d получен. Прогресс: %.2f%%</div>`, chunkIndex+1, totalChunks, progress)
+	fmt.Fprintf(w, `<div>Получено чанков: %d из %d. Прогресс: %.2f%%</div>`, len(files), totalChunks, progress)
 }
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `
+	htmlStr := fmt.Sprintf(`
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -243,58 +285,72 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	<div id="message"></div>
 </div>
 <script>
+window.MAX_CONCURRENT_CHUNKS = %d;
 function uploadFile(file) {
 	return new Promise((resolve, reject) => {
-		var chunkSize = 1024 * 1024;
+		var chunkSize = 100 * 1024 * 1024;
 		var totalChunks = Math.ceil(file.size / chunkSize);
 		var uploadID = 'upload_' + Math.random().toString(36).substr(2, 9);
 		var container = document.createElement("div");
-		container.innerHTML = '<strong>' + file.name + '</strong>: <span id="status_' + uploadID + '">0%</span>';
+		container.innerHTML = '<strong>' + file.name + '</strong>: <span id="status_' + uploadID + '">0%%</span>';
 		var progressDiv = document.createElement("div");
 		progressDiv.className = "progress mb-2";
-		progressDiv.innerHTML = '<div id="progress_' + uploadID + '" class="progress-bar" role="progressbar" style="width: 0%;">0%</div>';
+		progressDiv.innerHTML = '<div id="progress_' + uploadID + '" class="progress-bar" role="progressbar" style="width: 0%;">0%%</div>';
 		var fileBlock = document.createElement("div");
 		fileBlock.appendChild(container);
 		fileBlock.appendChild(progressDiv);
 		document.getElementById("message").appendChild(fileBlock);
-		function uploadChunk(chunkIndex) {
-			var start = chunkIndex * chunkSize;
-			var end = Math.min(start + chunkSize, file.size);
-			var chunk = file.slice(start, end);
-			var formData = new FormData();
-			formData.append('upload_id', uploadID);
-			formData.append('chunk_index', chunkIndex);
-			formData.append('total_chunks', totalChunks);
-			formData.append('filename', file.name);
-			formData.append('total_size', file.size);
-			formData.append('chunk', chunk);
-			var xhr = new XMLHttpRequest();
-			xhr.open('POST', '/upload_chunk', true);
-			xhr.onload = function() {
-				if(xhr.status === 200) {
-					document.getElementById("progress_" + uploadID).innerHTML = xhr.responseText;
-					if(xhr.responseText.indexOf("успешно") !== -1) {
-						document.getElementById("status_" + uploadID).textContent = "Завершено";
-						resolve();
+		var maxConcurrent = window.MAX_CONCURRENT_CHUNKS;
+		var currentIndex = 0;
+		function uploadChunk(index) {
+			return new Promise(function(res, rej) {
+				var start = index * chunkSize;
+				var end = Math.min(start + chunkSize, file.size);
+				var chunk = file.slice(start, end);
+				var formData = new FormData();
+				formData.append('upload_id', uploadID);
+				formData.append('chunk_index', index);
+				formData.append('total_chunks', totalChunks);
+				formData.append('filename', file.name);
+				formData.append('total_size', file.size);
+				formData.append('chunk', chunk);
+				var xhr = new XMLHttpRequest();
+				xhr.open('POST', '/upload_chunk', true);
+				xhr.onload = function() {
+					if(xhr.status === 200) {
+						res(xhr.responseText);
 					} else {
-						document.getElementById("status_" + uploadID).textContent = "Чанк " + (chunkIndex+1) + " из " + totalChunks;
-						uploadChunk(chunkIndex + 1);
+						rej(xhr.responseText);
 					}
-				} else {
-					document.getElementById("status_" + uploadID).textContent = "Ошибка: " + xhr.responseText;
-					reject(xhr.responseText);
-				}
-			};
-			xhr.onerror = function() {
-				document.getElementById("status_" + uploadID).textContent = "Ошибка загрузки чанка.";
-				reject("XHR error");
-			};
-			xhr.send(formData);
+				};
+				xhr.onerror = function() {
+					rej("XHR error");
+				};
+				xhr.send(formData);
+			});
 		}
-		uploadChunk(0);
+		function runNext() {
+			if (currentIndex >= totalChunks) return Promise.resolve();
+			var idx = currentIndex;
+			currentIndex++;
+			return uploadChunk(idx).then(function(resp) {
+				document.getElementById("progress_" + uploadID).innerHTML = resp;
+				document.getElementById("status_" + uploadID).textContent = "Чанк " + (idx+1) + " из " + totalChunks;
+				return runNext();
+			});
+		}
+		var pool = [];
+		for (var i = 0; i < Math.min(maxConcurrent, totalChunks); i++) {
+			pool.push(runNext());
+		}
+		Promise.all(pool).then(function() {
+			document.getElementById("status_" + uploadID).textContent = "Завершено";
+			resolve();
+		}).catch(function(err) {
+			reject(err);
+		});
 	});
 }
-
 document.getElementById('uploadForm').addEventListener('submit', function(e) {
 	e.preventDefault();
 	document.getElementById("message").innerHTML = "";
@@ -318,7 +374,9 @@ document.getElementById('uploadForm').addEventListener('submit', function(e) {
 </script>
 </body>
 </html>
-	`)
+`, MaxConcurrentChunks)
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, htmlStr)
 }
 
 func main() {
